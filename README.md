@@ -14,13 +14,13 @@ The emergence and rapid expansion of multiple [SARS-CoV-2 variants](https://www.
 
 ## Weighting and Weighted Proportion Estimates 
 
-Weights are estimated by treating each sequencing laboratory source as a cluster nested with strata (geographic level such as jurisdiction or region), calculated for each week (i.e., to ensure representation weekly). Two sets of weights are estimated: the first, w<sub>p</sub>, for representation among (PCR) test positive individuals; and second, w<sub>i</sub>, for representation among all prevalent infections. Assumptions (modifiable as data become available) in estimating weights are: 
+Weights are estimated by treating each sequencing laboratory source as a cluster nested with strata (geographic level such as jurisdiction or region), calculated for each week (i.e., to ensure representation weekly). Two sets of weights are estimated: the first,  <i>w<sub>p</sub></i>, for representation among (PCR) test positive individuals; and second,  <i>w<sub>i</sub></i>, for representation among all prevalent infections. Assumptions (modifiable as data become available) in estimating weights are: 
 * Each positive (PCR) test is in the sampling frame of one of the source streams, so that for each state, week and source 
 
 <img src="https://latex.codecogs.com/svg.image?w_p&space;=&space;\frac{\mbox{number&space;of&space;positive&space;PCR&space;test&space;results}}{\mbox{number&space;of&space;sequences&space;submitted}}" title="w_p = \frac{\mbox{number of positive PCR test results}}{\mbox{number of sequences submitted}}" />
 
 * Oversampling of S-gene target failure (SGTF) samples by one source results in a reduction in weights of SGTF sequences from that source by a factor that is estimated using a logistic regression model relating the odds of finding an “SGTF variant” by source, geographic level, and week. 
-* Estimation of w<sub>i</sub> involves estimating the (unobserved) number of infections from test results. There is no reliable and precise method for this yet, so these weights are subject to considerable uncertainties. Here, a [strategy](https://www.medrxiv.org/content/10.1101/2020.10.07.20208504v2.full) based on test positivity is used:
+* Estimation of  <i>w<sub>i</sub></i>  involves estimating the (unobserved) number of infections from test results. There is no reliable and precise method for this yet, so these weights are subject to considerable uncertainties. Here, a [strategy](https://www.medrxiv.org/content/10.1101/2020.10.07.20208504v2.full) based on test positivity is used:
 
 <img src="https://latex.codecogs.com/svg.image?\frac{\mbox{number&space;of&space;prevalent&space;infections}}{\mbox{number&space;of&space;test&space;positives}}&space;=&space;\sqrt{\frac{\mbox{population&space;of&space;jurisdiction}}{\mbox{number&space;of&space;tests}}}" title="\frac{\mbox{number of prevalent infections}}{\mbox{number of test positives}} = \sqrt{\frac{\mbox{population of jurisdiction}}{\mbox{number of tests}}}" />
 
@@ -28,7 +28,7 @@ If each source (lab) stream is assumed to sample from a base population with the
 
 <img src="https://latex.codecogs.com/svg.image?w_i&space;=&space;\frac{\mbox{number&space;of&space;prevalent&space;infections&space;in&space;source}}{\mbox{number&space;of&space;source&space;positives}}&space;=&space;\frac{\mbox{number&space;of&space;source&space;positives}}{\mbox{number&space;of&space;source&space;tests}}&space;&space;&space;{\frac{\sqrt{\mbox{population&space;of&space;jurisdiction}\times\mbox{number&space;of&space;tests}}}{\mbox{number&space;of&space;positives}}}" title="w_i = \frac{\mbox{number of prevalent infections in source}}{\mbox{number of source positives}} = \frac{\mbox{number of source positives}}{\mbox{number of source tests}} {\frac{\sqrt{\mbox{population of jurisdiction}\times\mbox{number of tests}}}{\mbox{number of positives}}}" />
 
-The “infection” weight for each sequence is w<sub>p</sub> x w<sub>i</sub> and depends on stratum (geographic level), time (week of collection), and cluster (source). 
+The “infection” weight for each sequence is  <i>w<sub>p</sub></i> x <i>w<sub>i</sub></i>  and depends on stratum (geographic level), time (week of collection), and cluster (source). 
 
 Three separate survey designs are used in this analysis: 
 * Unweighted to estimate variant prevalence among sequenced samples 
@@ -37,23 +37,23 @@ Three separate survey designs are used in this analysis:
 
 ## Nowcast Projection Model 
 
-A simple multivariant model with variants labeled i is: 
+ A simple multivariant model with variants labeled  <i>i</i>  is: 
 
-<img src="https://latex.codecogs.com/svg.image?\frac{dv_{i}}{dt}=\left&space;(&space;\beta_{i}s&space;-&space;\gamma&space;&space;\right&space;)v_{i}" title="\frac{dv_{i}}{dt}=\left ( \beta_{i}s - \gamma \right )v_{i}" />
+<img src="https://latex.codecogs.com/svg.image?\frac{dv_i}{dt}&space;=&space;(\beta_i&space;s_i&space;-&space;\gamma_i)v_i" title="\frac{dv_i}{dt} = (\beta_i s_i - \gamma_i)v_i" />
 
-Here s is the proportion susceptible in the population, and &gamma; is the recovery rate. The formal solution
+Here  <i>s<sub>i</sub></i>  is the proportion susceptible in the population, and  <i>&gamma;</i>  is the recovery rate. The formal solution
 
-<img src="https://latex.codecogs.com/svg.image?v_{i}\left&space;(&space;t&space;\right&space;)&space;=&space;v_{i}\left&space;(&space;0&space;\right&space;)e^{\int&space;\left&space;(&space;\beta_{i}s&space;-&space;\gamma&space;\right&space;)dt}" title="v_{i}\left ( t \right ) = v_{i}\left ( 0 \right )e^{\int \left ( \beta_{i}s - \gamma \right )dt}" />
+<img src="https://latex.codecogs.com/svg.image?v_i(t)&space;=&space;v_i(0)&space;e^{\int&space;(\beta_i&space;s_i&space;-&space;\gamma_i)\,dt}" title="v_i(t) = v_i(0) e^{\int (\beta_i s_i - \gamma_i)\,dt}" />
 
 so that 
 
-<img src="https://latex.codecogs.com/svg.image?\frac{v_i(t)}{v_j(t)}&space;=&space;\frac{v_i(0)}{v_j(0)}e^{\int&space;(\beta_i&space;-\beta_j)s\,dt}" title="\frac{v_i(t)}{v_j(t)} = \frac{v_i(0)}{v_j(0)}e^{\int (\beta_i -\beta_j)s\,dt}" />
+<img src="https://latex.codecogs.com/svg.image?\frac{v_i(t)}{v_j(t)}&space;=&space;\frac{v_i(0)}{v_j(0)}e^{\int&space;(\beta_is_i&space;-\gamma_i&space;-\beta_js_j&space;&plus;&space;\gamma_j)\,dt}" title="\frac{v_i(t)}{v_j(t)} = \frac{v_i(0)}{v_j(0)}e^{\int (\beta_is_i -\gamma_i -\beta_js_j + \gamma_j)\,dt}" />
 
 If, as is often the case, the integrand is a slowly varying function of time, a multinomial log-linear model may be a good fit for the variant proportions 
 
 <img src="https://latex.codecogs.com/svg.image?p_i(t)&space;=&space;\frac{v_i(t)}{\sum_j&space;v_j(t)}" title="p_i(t) = \frac{v_i(t)}{\sum_j v_j(t)}" />
 
-The model coefficients b<sub>0i</sub> and b<sub>1i</sub> are such that 
+The model coefficients  <i>b<sub>0i</sub></i>  and  <i>b<sub>1i</sub></i>  are such that 
 
 <img src="https://latex.codecogs.com/svg.image?p_i(t)&space;=&space;\frac{e^{b_{0i}&space;&plus;&space;b_{1i}t}}{\sum_j&space;e^{b_{0j}&space;&plus;&space;b_{1j}t}}" title="p_i(t) = \frac{e^{b_{0i} + b_{1i}t}}{\sum_j e^{b_{0j} + b_{1j}t}}" />
 

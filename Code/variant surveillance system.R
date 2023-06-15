@@ -5,243 +5,8 @@
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
-# Part 1: Data Prep & weight calculation ---------------------------------------
+# Part 1: Define Functions ----------------------------------------------------
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
-
-library(survey)     # package with survey design functions
-library(nnet)       # package with multinomial regression for "Nowcast" model
-library(data.table) # package for speeding up calculations
-
-# set global options:
-#  - tell the survey package how to handle surveys where only a single primary
-#    sampling units has observations from a particular domain or subpopulation.
-#    See more here:
-#    https://r-survey.r-forge.r-project.org/survey/exmample-lonely.html
-#  - do not convert strings to factors (as was default in R < 4.0)
-options(survey.adjust.domain.lonely = T,
-        survey.lonely.psu = "average",
-        stringsAsFactors = FALSE)
-
-# define "%notin%" function
-`%notin%` <- Negate(`%in%`)
-
-## Load sequence data with test tallies ----------------------------------------
-dat <- readRDS(file = 'example_data.RDS')
-# these data have already been filtered to ensure: 
-# 1) all sequences are from human hosts
-# 2) all sequences originated from the USA
-# 3) all sequences have valid state abbreviations
-# 4) there are no duplicates
-# 5) all dates are valid (i.e. >= 2019-10-01 and <= (day of the analysis))
-# 6) all sequences come from labs that provided at least 100 sequences total
-# 7) all sequences are attributable to a lab (i.e. drop NA's)
-# 8) all sequences have a valid variant name (ie. drop NA's and "None")
-
-# create a variable for aggregating counts of different groupings of samples
-dat$count = 1
-
-# convert the data.frame to a data.table for faster calculation
-dat = data.table::data.table(dat)
-
-
-
-## Some general parameters -----------------------------------------------------
-
-# starting date for defining weeks
-week0day1 = as.Date("2020-01-05")
-
-# Variants to be included in the analysis (not limited to VOCs; can be any Pango lineage)
-voc = c("B.1.1.7",   # Alpha
-        "P.1",       # Gamma
-        "B.1.617.2", # Delta
-        "C.37",      # Lambda
-        "B.1.621",   # Mu 
-        "B.1.1.529") # Omicron
-
-# fewer variants runs faster
-voc = c('B.1.617.2', 
-        'B.1.1.529', 
-        'AY.103')
-
-## Aggregate sublineages -------------------------------------------------------
-# all the AY sublineages
-AY = sort(unique(dat$VARIANT)[grep("AY",unique(dat$VARIANT))])
-# just the AY sublineages that are to be aggregated (i.e. not listed in "voc")
-AY = AY[which(AY %notin% voc)]
-# aggregate sublineages to the parent lineage
-dat[dat$VARIANT %in% AY, "VARIANT"] <- "B.1.617.2"
-
-P1 = sort(unique(dat$VARIANT)[grep("P\\.1.",unique(dat$VARIANT))])
-P1 = P1[which(P1 %notin% voc)] #vector of the P1s to aggregate
-dat[dat$VARIANT %in% P1, "VARIANT"] <- "P.1"
-
-Q = sort(unique(dat$VARIANT)[grep("Q\\.",unique(dat$VARIANT))])
-Q = Q[which(Q %notin% voc)] #vector of the Qs to aggregate
-dat[dat$VARIANT %in% Q, "VARIANT"] <- "B.1.1.7"
-
-B351 = sort(unique(dat$VARIANT)[grep("B\\.1\\.351\\.",unique(dat$VARIANT))])
-B351 = B351[which(B351 %notin% voc)] #vector of the B351s to aggregate
-dat[dat$VARIANT %in% B351,"VARIANT"] <- "B.1.351"
-
-B621 = sort(unique(dat$VARIANT)[grep("B\\.1\\.621\\.",unique(dat$VARIANT))])
-B621 = B621[which(B621 %notin% voc)] #vector of the B621s to aggregate
-dat[dat$VARIANT %in% B621,"VARIANT"] <- 'B.1.621'
-
-B429 = sort(unique(dat$VARIANT)[grep("B\\.1\\.429",unique(dat$VARIANT))])
-B429 = B429[which(B429 %notin% voc)] #vector of the B429s to aggregate
-dat[dat$VARIANT %in% B429,"VARIANT"] <- "B.1.427"
-
-B529 = sort(unique(dat$VARIANT)[grep("(B\\.1\\.1\\.529)|(BA\\.[0-9])",unique(dat$VARIANT))])
-B529 = B529[which(B529 %notin% voc)] #vector of the B529s to aggregate
-dat[dat$VARIANT %in% B529,"VARIANT"] <- "B.1.1.529"
-
-## SGTF over-sampling weights --------------------------------------------------
-## weighting adjusted for oversampling/targeted sampling of SGTF+ specimens sent for sequencing
-# counts of lineages by contractor name & SGTF upsampling status
-sgtf.1 = table(dat$VARIANT,
-               paste(dat$SOURCE,
-                     dat$SGTF_UPSAMPLING))
-
-# Get the labs/columns with s-gene target failure oversampling
-# (identified by having more SGTF_UPSAMPLING==TRUE tests than SOURCE=="17" tests)
-sgtf.vars = rownames(sgtf.1)[
-  sgtf.1[, grep(pattern = "TRUE$", x = colnames(sgtf.1))] > 
-    sgtf.1[, grep(pattern = "17 FALSE$", x = colnames(sgtf.1))] ]
-
-# calculate SGTF weights using sets of states and weeks where targeted samples were sequenced
-sgtf.sub = unique(
-  subset(
-    x = dat,
-    SGTF_UPSAMPLING
-  )[, c("STUSAB", "yr_wk")]
-)
-
-# fit a logistic model to estimate probability of a sequence having been 
-# sequenced b/c of SGTF
-sgtf.glm = glm(
-  I(VARIANT %in% sgtf.vars) ~ I(SOURCE %in% "17") + STUSAB + yr_wk,
-  family="binomial",
-  subset(dat, yr_wk %in% sgtf.sub$yr_wk & 
-           STUSAB %in% sgtf.sub$STUSAB))
-
-# add SGTF upsampling weights to the subset data
-sgtf.sub$sgtf_weights = predict(
-  object = sgtf.glm, 
-  newdata = cbind(SOURCE = c("17"), 
-                  sgtf.sub), 
-  type="response"
-) / predict( 
-  object = sgtf.glm, 
-  newdata = cbind(SOURCE = c("OTHER"), 
-                  sgtf.sub), 
-  type="response"
-)
-
-# merge SGTF upsampling weights into the main dataset
-dat <- merge(x = dat, 
-             y = sgtf.sub, 
-             by = c('STUSAB', 'yr_wk'), 
-             all.x = TRUE)
-
-# replace NA weights with 1
-dat[ is.na(dat$sgtf_weights), 'sgtf_weights'] <- 1
-
-
-## Survey Weights --------------------------------------------------------------
-# Estimation of the infection weights involves estimating the (unobserved) number
-# of infections from test results. There is no reliable and precise method for this
-# yet, so these weights are subject to considerable uncertainties.
-# We use methods in:
-#     https://www.cdc.gov/mmwr/volumes/70/wr/mm7023a3.htm
-#     https://www.medrxiv.org/content/10.1101/2020.10.07.20208504v2.full-text
-# Other strategies are also available; e.g.
-#     https://covid19-projections.com/estimating-true-infections-revisited/
-
-
-# calculate simple adjusted weights
-dat[, 
-    "SAW" := sqrt(state_population/TOTAL) * POSITIVE/sum(1/sgtf_weights)/sgtf_weights,
-    .(STUSAB, yr_wk)]
-# calculate simple adjusted weights for states that lack testing data
-# (use average values from HHS region)
-dat[, 
-    "SAW_ALT" := state_population*HHS_INCIDENCE / sum(1/sgtf_weights)/sgtf_weights,
-    .(STUSAB, yr_wk)]
-# use "SAW_ALT" when SAW is NA
-dat[, "SIMPLE_ADJ_WT" := ifelse(is.na(SAW), SAW_ALT, SAW)]
-# remove "SAW" and "SAW_ALT" columns
-dat[, c("SAW", "SAW_ALT") := .(NULL, NULL)]
-
-
-# Make sure all survey weights are valid numbers
-# (this shouldn't be necessary, just precautionary)
-dat = subset(x = dat,
-             !is.na(SIMPLE_ADJ_WT) &
-               SIMPLE_ADJ_WT < Inf)
-
-## Survey Design & Weight Trimming ---------------------------------------------
-
-# weights are trimmed to avoid overly influential samples
-# current week 
-current_week = as.numeric(Sys.Date() - week0day1) %/% 7
-
-# add the current week to the source data
-dat$current_week = current_week
-
-# create another column for the variants of interest
-# this is only used to get (unweighted) counts of the sequences by lineage
-dat$VARIANT2 = as.character(dat$VARIANT)
-# group all non-"variants of interest" together
-dat[dat$VARIANT %notin% voc, "VARIANT2"] <- "Other"
-
-
-# specify survey design 
-svyDES = survey::svydesign(ids     = ~ SOURCE,
-                           strata  = ~ STUSAB + yr_wk,
-                           weights = ~ SIMPLE_ADJ_WT,
-                           nest    = TRUE, # TRUE = disable checking for duplicate cluster ID's across strata
-                           data    = dat)  # not specifying fpc signifies sampling with replacement
-
-# maximum weight; trim weights > 99th percentile
-max_weight <- quantile(x = weights(svyDES),
-                       probs = .99)
-
-# get the minimum weight to replace weights of 0
-# weights of 0 can happen if very limited testing data are available for a state
-# in a given week. E.g. if 0 of 2 tests were positive, then any sequences that 
-# came from that state in that week would represent 0 infections. 
-wts <- weights(svyDES)
-min_wt <- min(wts[wts > 0])
-  
-# trim weights using the min & max weights calculated above
-svyDES <- survey::trimWeights(design = svyDES,
-                              upper = max_weight,
-                              lower = min_wt)
-
-# add weights back into the dataframe
-dat$weights = weights(svyDES)
-
-## Center "week" for use in Nowcast multinomial model --------------------------
-
-# final date of data to include in model
-time_end <- '2022-01-01'
-# number of weeks to include in the model
-model_weeks <- 20
-# maximum week included in the model
-model_week_max = as.numeric(as.Date(time_end) - week0day1) %/% 7
-# 1 week before first week included in the model
-model_week_min = model_week_max - model_weeks
-# a midpoint week that will be used to center week values 
-model_week_mid = round(model_weeks/2) # center it around 0 instead of using 1:model_weeks
-# create a dataframe of old and new values to help visualize things
-model_week_df = data.frame(week = 1:model_weeks + model_week_min, # week number (since week0day1)
-                           model_week = 1:model_weeks - model_week_mid, # week number for use in nowcast model
-                           week_start = (1:model_weeks + model_week_min)*7 + as.Date(week0day1), # date of first day of week
-                           week_mid   = (1:model_weeks + model_week_min)*7 + as.Date(week0day1) + 3, # date of midday of week
-                           week_end   = (1:model_weeks + model_week_min)*7 + as.Date(week0day1) + 6) # date of final day of week
-# add the new model_week info to the dataframe
-dat$model_week = dat$week - model_week_min - model_week_mid
-
 ## Functions that do all the heavy lifting -------------------------------------
 
 # Helper wrapper for survey::svyciprop
@@ -315,6 +80,7 @@ myciprop = function(voc,
       survey::svyciprop(~VOC,
                         design = srv_design,
                         method = "xlogit",
+                        level = level,
                         ...)
     )
   } else {
@@ -323,6 +89,7 @@ myciprop = function(voc,
     res = suppressWarnings(
       svycipropkg(~VOC,
                   design = srv_design,
+                  level = level,
                   ...)
     )
   }
@@ -414,23 +181,6 @@ myciprop = function(voc,
   res
 }
 
-# function to calculate & format a date based on # of weeks from datadate
-week_label = function(week_from_current,
-                      datadate = Sys.Date()) {
-  # returns the date of the first day of a future week in "%m-%d" format
-  
-  # the current day of the week
-  day_of_week = as.numeric(strftime(as.Date(datadate), format="%w"))
-  
-  # start of current week
-  start_of_week = as.Date(datadate) - day_of_week
-  
-  # formatted date of a future week
-  strftime(x = start_of_week + 7 * week_from_current,
-           format = "%m-%d")
-}
-
-
 #Functions for multinomial nowcast model
 # this function fits a multinomial model to the data to get temporally smoothed
 # proportion estimates while also accounting survey design.
@@ -448,7 +198,7 @@ week_label = function(week_from_current,
 #          approximation)
 svymultinom = function(mod.dat,
                        mysvy,
-                       fmla = formula("as.numeric(as.factor(K_US)) ~ week + as.factor(HHS)"),
+                       fmla = formula("as.numeric(as.factor(K_US)) ~ model_week + as.factor(HHS)"),
                        model_vars) {
   # Arguments:
   #  ~  mod.dat: source data (data.table)
@@ -540,12 +290,8 @@ svymultinom = function(mod.dat,
   rval$estimates = as.list(data.frame(t(rval$estimates)))
   ## End multinomial regression
   
-  # add the variant names into the results to make the results easier to read
-  # (first variant is used as comparison for all others)
-  # names(rval$estimates) <- modvars$Variant[-1]
-  
-  # use a "try-catch" function to try to calculate the inverse of the negative  
-  # Hessian, which is used below.  
+  # check if the Hessian is invertible
+  #   if not, return NA
   invinf <- tryCatch( 
     { 
       solve(-multinom_geoid$Hessian) 
@@ -555,7 +301,7 @@ svymultinom = function(mod.dat,
     } 
   ) 
 
-  # if the Hessian is not invertible, avoid errors by not running the rest of the function
+  # If the Hessian is NOT invertible, just create the output.
   # (note: the se.multinom function will still run on the output of this function,
   #  but will assume the SE is 0)
   if ( is.na(invinf[1]) ){ 
@@ -605,7 +351,7 @@ svymultinom = function(mod.dat,
     print(hess_headtail[c(1:5, (nrow(hess_headtail)-4):nrow(hess_headtail)),])
     
   } else {
-    # if the Hessian is solvable, proceed:
+    # if the Hessian is solvable, then adjust variance-covariance matrix using survey design
     
     ## Define likelihood
     
@@ -831,21 +577,20 @@ svymultinom = function(mod.dat,
 #       errors using the results of "svymultinom"; the "svymultinom" function
 #       fits the model and estimates the SE of model coefficients.
 se.multinom = function(mlm,
-                       week,
-                       geoid = "USA",
+                       newdata_1row,
                        composite_variant = NULL) {
   # Arguments:
   #  ~  mlm:   model output, with Hessian;
-  #  ~  week:  focal week (model_week) to calculate the SE for
-  #  ~  geoid: geographic region; options include "USA" or HHS Region (1:10)
-  #  ~  composite_variant: (if not NA) is a matrix with one column per model
+  #  ~  newdata_1row:  1-row dataframe consistent with predictors in formula
+  #                    typically includes focal week (model_week) & geographic region
+  #  ~  composite_variant: (if not NULL) is a matrix with one column per model
   #                        lineage and one row per composite variant. Matrix
-  #                        element of 1 marks each component lineage (column)
-  #                        for each composite variant (row).
+  #                        element of 1 marks each model lineage (column)
+  #                        for aggregation into a composite variant (row).
   #                        Example: matrix(c(1, 0, 0, 1, 0, 0), nrow = 1)
-  #                        designates a variant comprising the first and fourth
-  #                        lineages in the model estimates for composites will
-  #                        be appended at end of p_i and se.p_i
+  #                        will combine the first and fourth lineages in the 
+  #                        model into a single estimate, which will be appended
+  #                        at end of p_i and se.p_i
   
   # If mlm is without Hessian, all se's are set to zero
   # mlm not geographically stratified for geoid="USA": ~ (week - current_week)
@@ -855,6 +600,8 @@ se.multinom = function(mlm,
   #  ~  p_i:     predicted values for each clade/variant (numeric vector)
   #  ~  se.p_i:  SE of predicted values (numeric vector)
   #  ~  b_i:     coefficient (beta) values (numeric vector)
+  #              NOTE! b_i is only interpretable as growth rates if first
+  #                    predictor term is time!
   #  ~  se.b_i:  SE of coefficients (numeric vector)
   #  ~  composite_variant: list with 3 element:
   #                        matrix = composite_variant (input matrix)
@@ -880,68 +627,38 @@ se.multinom = function(mlm,
     } else {
       # If there's no variance-covariance matrix from the svymultinom function
       # and there's no Hessian, just set the variance-covariance to 0
-      vc = rep(0, length(cf)^2)
+      vc = matrix(data = 0,
+                  nrow = length(cf),
+                  ncol = length(cf))
     }
   }
   
-  # Rearrange terms to ease pulling out relevant submatrix
-  # convert symmetrical matrix with rows & columns for each coefficient:
-  # 4-d array with dim 1 for each covariate
-  #                dim 2 for each outcome class
-  #                dim 3 for each covariate
-  #                dim 4 for each outcome class
-  dim(vc) = rep(x = rev(dim(cf)),
-                times = 2)
+  # get the model matrix from the model fit & the new data
+  mm = model.matrix(as.formula(paste("~",as.character(mlm$terms)[3])),
+                    newdata_1row,
+                    xlev = mlm$xlevels)
   
-  # Boolean: is the geoid the reference level
-  ref_geoid = ((length(mlm$xlevels) == 0) || (geoid == mlm$xlevels[[1]][1]))
+  # get the covariate names for each variant
+  mnames = outer(X = mlm$lev[-1],
+                 Y = colnames(mm),
+                 FUN = paste, sep=":")
   
-  # get the number/index of the geoid/area being modeled
-  if (ref_geoid) { # if the geoid is the reference level
-    n_geoid = NULL
-  } else { # if it's not the reference level
-    n_geoid = which(mlm$xlevels[[1]] == geoid)
-  }
+  # matrix of covariate values (first create empty matrix)
+  cmat = matrix(data = 0,
+                nrow = nrow(mnames),
+                ncol = ncol(vc),
+                dimnames = list(mlm$lev[-1],
+                                as.vector(t(mnames))))
   
-  # Set value for "hhs1tail"
-  # index of column identifying column for the hhs region in question
-  if (ref_geoid) { # if the geoid is the reference level
-    hhs1tail = NULL
-  } else { # if it's not the reference level
-    hhs1tail = n_geoid + 1
-  }
+  # fill in covariate values into the cmat
+  for (rr in 1:nrow(cmat)) cmat[rr, mnames[rr,]] = c(mm)
   
-  # save values to vector
-  # only want the coefficients for the intercept, the week in question, and the
-  # hhs region in question
-  indices = c(1, 2, hhs1tail)
-  
-  # reset value for "hhs1tail"
-  # indicator (0/1) covariate value (1 for the hhs region in question)
-  if (ref_geoid) {
-    hhs1tail = NULL
-  } else {
-    hhs1tail = 1
-  }
-  
-  # save values to another vector
-  coeffs = c(1, week, hhs1tail)
-  
-  # b is vector of coefficients of time (week)
-  # subset the variance-covariance matrix to the relevant parameters
-  sub.vc = vc[indices,,indices,]
-  
-  # get the linear predictor values
-  y_i = c(0, cf[, indices] %*% coeffs)
+  # linear predictor values
+  y_i = c(0, coefficients(mlm) %*% c(mm))
   
   # get the variance-covariance matrix of the linear predictor
   # (after adjusting for survey design)
-  vc.y_i = outer(1:dim(sub.vc)[2],
-                 1:dim(sub.vc)[4],
-                 Vectorize(function(i, j) c(coeffs %*% sub.vc[, i, , j] %*% coeffs)))
-  
-  # add in row and column with 0
-  vc.y_i = rbind(0, cbind(0, vc.y_i))
+  vc.y_i = rbind(0, cbind(0, cmat %*% vc %*% t(cmat)))
   
   # calculate the predicted proportions
   p_i = exp(y_i)/sum(exp(y_i))
@@ -964,31 +681,44 @@ se.multinom = function(mlm,
     )
   }
   
+  # change the dimensions of the variance-covariance matrix to aid in
+  # pulling out the coefficient of time.
+  dim(vc) = rep(rev(dim(cf)), 2)
+
   # output
-  list(p_i = p_i, # predicted values
-       se.p_i = se.p_i, # SE of predicted values
-       b_i = c(0, cf[, 2]), # coefficient value for week
-       se.b_i = c(0, sqrt(diag(vc[2,,2,]))), # SE of the coefficient
-       composite_variant = composite_variant) # predicted probabilities (and SE) for the composite variants
+  return(
+    list(p_i = p_i, # predicted values
+         se.p_i = se.p_i, # SE of predicted values
+         b_i = c(0, cf[, 2]), # coefficient value for week
+         se.b_i = c(0, sqrt(diag(vc[2,,2,]))), # SE of the coefficient
+         composite_variant = composite_variant) # predicted probabilities (and SE) for the composite variants
+  )
 }
 
 # Function to get binomial confidence interval based on the point estimated
 # proportion and associated SE
 # (based on output from svymultinom & se.multinom functions)
-svyCI = function(p, s) {
+svyCI = function(p, s, ...) {
   # p = point estimate
   # s = estimated standard error
+  # ... optional arguments passed on to prop.test (e.g. conf.level = 0.95)
   
   # if se is 0, n will be Inf (possibly because of non-invertible Hessian); return CI of 0,0
-  if(s == 0){
-    return(c(0,0))
+  if (s == 0) {
+    return(c(0, 0)) # return confidence interval of [0,0]
+  } else if (p == 0) {
+    # if p == 0 or p == 1, then n will be 0 & prop.test will throw an error
+    return(c(0, 0)) # return confidence interval of [0,0]
+  } else if (p == 1) {
+    return(c(1, 1)) # return confidence interval of [1,1]
   } else {
     # calculate the sample size
     n = p*(1-p)/s^2
     
     # calculate the confidence interval using a proportion test
     out = prop.test(x = n * p,   # a vector of counts of successes
-                    n = n        # a vector of counts of trials
+                    n = n,       # a vector of counts of trials
+                    ...          # optional arguments (e.g. conf.level = 0.99)
     )$conf.int
 
     # return the lower and upper confidence interval limits
@@ -1071,9 +801,361 @@ svycipropkg <- function(formula,
   rval
 }
 
+# define "%notin%" function
+`%notin%` <- Negate(`%in%`)
+
+
+# define some functions for lineage aggregation
+{
+  # define a function to find a variant's nearest parent from a list of
+  # options. It defines "parent" as the longest string that is a subset
+  # of the child variant name. (So it only works on extended names, not on Pango abbreviations.)
+  # If no match is found, it returns "Other"
+  # takes 3 arguments:
+  # arg x  = (string) variant name to look up
+  # arg y  = (string) vector of voc (extended)
+  # arg no_match = (string) what to return if there is no match
+  # returns string with the parent's name
+  np = function(x, y, no_match = 'Other') {
+
+    # only look for parents in y, so each y MUST be shorter than x
+    y <- y[ nchar(y) <= nchar(x) ]
+
+    # add a "." to all y that are shorter than x (to make sure that the parent variant IS a parent)
+    # e.g. without the extra ".", the parent of BA.5.22 might be identified as BA.5.2 (shorter & a perfect subset)
+    y. <- y
+    y.[ nchar(y) < nchar(x) ] <- paste0(y[ nchar(y) < nchar(x) ], '.')
+
+    # split out each character in x & y
+    sx = strsplit(x, "", fixed = TRUE)
+    sy = strsplit(y., "", fixed = TRUE)
+
+    # calculate an array of match proportions
+    match_array <- array(
+      # cycle over each string in X and Y
+      data = mapply(function(X, Y) {
+        # get the length of the shorter (parent) string
+        #slen = seq_len(min(length(X), length(Y)))
+        ylen <- seq_len(length(Y))
+
+        # test if the first slen characters are the same in both strings
+        # if they're not the same, calculate the proportion of characters (starting from the beginning) that are the same (i.e. how far you get through the string before the first mismatch)
+        # wh <- (X[slen] == Y[slen])
+        # if(all(wh)) return(1) else (which.min(wh) - 1) / length(slen)
+        wh <- (X[ylen] == Y[ylen])
+        if(all(wh)) return(1) else (which.min(wh) - 1) / length(ylen)
+      },
+      # values of X to pass to mapply function (just repeat x for each item in y)
+      rep(sx, each = length(sy)),
+      # values of Y to pass to mapply function
+      sy),
+      # dimensions for the array
+      dim = c(length(x), length(y)),
+      # names of the dimensions for the array
+      dimnames = list(x, y)
+    )
+    # match_array has x strings on the x-axis and y strings on the
+    # y-axis. The numbers in the array are the proportion of the 2 strings
+    # that match (starting from beginning; so the proportion is how far through
+    # the string you get before the first mismatch). A value of 1
+    # means that the shorter string is a subset of the longer string.
+
+    # id which matches are complete matches
+    match100 <- colnames(match_array)[ match_array[1,] == 1 ]
+
+    # if there are complete matches, get the parent
+    if( length(match100) > 0 ) {
+
+      # the longest complete match is the closest parent
+      return(match100[ nchar(match100) == max(nchar(match100)) ])
+
+      # # return the longest complete match (that is still shorter than x) as the nearest parent
+      # match100_2 <- match100[ (nchar(match100) < nchar(x)) ]
+      #
+      # # if there are complete matches where
+      # if( length(match100_2) > 0 ) return(match100_2[ nchar(match100_2) == max(nchar(match100_2)) ])
+      # else return(no_match)
+    } else {
+      # if there are no complete matches, return "Other"
+      return(no_match)
+    }
+  }
+  # sapply(sort(unname(unlist(extra_voc_to_consider))), function(x) nearest_parent(x, vocxl))
+
+  # convert function "np" to work on a vector of x (reuses the same y vector for each element in x)
+  nearest_parent <- function(x, y, no_match = 'Other') {
+    # this just uses "sapply" to look for the nearest parent of each x in y
+    sapply( x, function(x_i) np(x_i,  y ) )
+  }
+
+  # # This is a shorter & easier-to-understand version of the "np" function
+  # # (but it runs about 8 times slower than "np")
+  # np2 <- function(x, y, no_match = 'Other'){
+  #
+  #    # y is a parent of x if x & y start with identical characters, then the next character in x is either "\\." or end of string "$"
+  #    # all the parent variants in y
+  #    all_pv <- y[unlist(lapply(y, function(p){
+  #       grepl(pattern = paste0(gsub(pattern = '\\.', replacement = '\\\\.', paste0('^', p)), '((\\.)|($))'),
+  #            x = x)
+  #    }))]
+  #
+  #    # if there are complete matches, get the parent
+  #    if( length(all_pv) > 0 ) {
+  #
+  #       # only the max-length parent variant
+  #       all_pv[ nchar(all_pv) == max(nchar(all_pv))]
+  #
+  #    } else {
+  #       # if there are no complete matches, return "Other"
+  #       return(no_match)
+  #    }
+  # }
+}
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
-# Part 2: Calculating Variant Proportions --------------------------------------------
+# Part 2: Data Prep & weight calculation --------------------------------------
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+
+library(survey)     # package with survey design functions
+library(nnet)       # package with multinomial regression for "Nowcast" model
+library(data.table) # package for speeding up calculations
+
+# set global options:
+#  - tell the survey package how to handle surveys where only a single primary
+#    sampling units has observations from a particular domain or subpopulation.
+#    See more here:
+#    https://r-survey.r-forge.r-project.org/survey/exmample-lonely.html
+#  - do not convert strings to factors (as was default in R < 4.0)
+options(survey.adjust.domain.lonely = T,
+        survey.lonely.psu = "average",
+        stringsAsFactors = FALSE)
+
+## Load sequence data with test tallies ----------------------------------------
+dat <- readRDS(file = 'example_data.RDS')
+# these data have already been filtered to ensure: 
+# 1) all sequences are from human hosts
+# 2) all sequences originated from the USA
+# 3) all sequences have valid state abbreviations
+# 4) there are no duplicates
+# 5) all dates are valid (i.e. >= 2019-10-01 and <= (day of the analysis))
+# 6) all sequences come from labs that provided at least 100 sequences total
+# 7) all sequences are attributable to a lab (i.e. drop NA's)
+# 8) all sequences have a valid variant name (ie. drop NA's and "None")
+
+# create a variable for aggregating counts of different groupings of samples
+dat$count = 1
+
+# convert the data.frame to a data.table for faster calculation
+dat = data.table::as.data.table(dat)
+
+
+
+## Some general parameters -----------------------------------------------------
+
+# starting date for defining weeks
+week0day1 = as.Date("2020-01-05")
+
+# Variants to be included in the analysis (not limited to VOCs; can be any Pango lineage)
+voc = c("BA.1.1",
+        "BA.2",
+        "BA.2.12.1",
+        "BA.2.75",
+        "BA.2.75.2",
+        "CH.1.1",
+        "BF.7",
+        "BF.11",
+        'BA.4',
+        'BA.4.6',
+        'BA.5',
+        'BA.5.2.6',
+        "BQ.1",
+        "BQ.1.1",
+        "BN.1",
+        "XBB",
+        'XBB.1.5',
+        'XBB.1.5.1',
+        'XBB.1.9.1',
+        'FD.2',
+        'XBB.1.9.2',
+        'XBB.1.16',
+        'XBB.2.3',
+        "B.1.617.2", # Delta
+        "B.1.1.529") # Omicron
+
+# fewer variants runs faster
+# voc = voc[16:18]
+
+## Aggregate sublineages -------------------------------------------------------
+# This is an inefficient system based on abbreviated Pango lineage names, which necessitates a lot of code.
+# All that it does is assign each Pango lineage to its nearest parent lineage that is included in "voc".
+# make sure "VARIANT" is a character (rather than factor)
+# (redundant with "stringsAsFactors = FALSE")
+dat$VARIANT <- dat$lineage <- as.character(dat$VARIANT)
+
+# create a table of abbreviated & expanded lineages
+lut <- dat[, .(expanded_lineage = unique(expanded_lineage)), by = 'VARIANT']
+
+# lineage_expanded for each voc
+voc_expanded <- lut[ VARIANT %in% voc ][['expanded_lineage']]
+
+# all variants in the data
+unique_vars <- na.omit(unique(dat$VARIANT))
+# lineage_expanded for each of unique_vars
+unique_lineage_expanded <- unname(setNames(lut$expanded_lineage, lut$VARIANT)[ unique_vars ])
+
+# create a lookup table for all the variants in the data
+# (originally "lut" included all Pango lineages in the database)
+# variant = abreviated variant name
+# lineage_expanded
+# parent_lineage_expanded = lineage_expanded that this variant will be aggregated into
+# parent_variant = variant that this variant will be aggregated into
+voc_lut <- data.frame(
+'variant'                  = unique_vars,
+'lineage_expanded'         = unique_lineage_expanded,
+'parent_lineage_expanded'  = nearest_parent(unique_lineage_expanded, voc_expanded)
+)
+
+# add in the parent variant
+voc_lut$parent_variant <- setNames(voc_lut$variant, voc_lut$lineage_expanded)[voc_lut$parent_lineage_expanded]
+# update the row names
+row.names(voc_lut) <- 1:nrow(voc_lut)
+
+
+# use the voc_lut to get the aggregation variant ("parent_variant") for each variant
+dat$VARIANT <- setNames(voc_lut$parent_variant, voc_lut$variant)[ dat$VARIANT ]
+# see which variants were changed: data.table:::unique.data.table(dat[VARIANT != lineage, .(VARIANT, lineage)])
+
+# create another column for the varients of interest
+# this is only used to get (unweighted) counts of the sequences by lineage (used in all runs)
+dat$VARIANT2 = as.character(dat$VARIANT)
+# group all non-"variants of interest" together
+dat[dat$VARIANT %notin% voc, "VARIANT2"] <- "Other"
+
+
+# SGTF over-sampling was a temporary issue and has been removed
+
+
+
+## Survey Weights --------------------------------------------------------------
+# Estimation of the infection weights involves estimating the (unobserved) number
+# of infections from test results. There is no reliable and precise method for this
+# yet, so these weights are subject to considerable uncertainties.
+# We use methods in:
+#     https://www.cdc.gov/mmwr/volumes/70/wr/mm7023a3.htm
+#     https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1009374
+# Other strategies are also available; e.g.
+#     https://covid19-projections.com/estimating-true-infections-revisited/
+
+
+# UPDATED weights using NREVSS testing data
+# proxy_infections    = estimated number of infections in a given state-week
+# state_population    = state population
+# POSITIVE.HHS.nrevss = number of positive tests reported to NREVSS in a given HHS region in a given week
+# TOTAL.HHS.nrevss    = number of total    tests reported to NREVSS in a given HHS region in a given week
+# POSITIVE.HHS        = number of positive tests reported to CLERS in a given HHS region in a given week
+# population_reporting.HHS = total population of the states in a given HHS region that reported tests to CLERS in a given week
+dat[
+   ,
+   "proxy_infections" := state_population * sqrt(POSITIVE.HHS.nrevss / TOTAL.HHS.nrevss) *
+      sqrt( POSITIVE.HHS / population_reporting.HHS )]
+# this formula is equivalent to calculating the regional infections as: sqrt(POSITIVE.HHS.nrevss / TOTAL.HHS.nrevss * population_reporting.HHS * POSITIVE.HHS) and then splitting it up among states in the region based on population (i.e. multiplying by): (state_population / population_reporting.HHS)
+
+# calculate the weight (number of infections represented by each sequence) based on "proxy_infections"
+dat[, 'weight' := proxy_infections / sum(count), by = c('STUSAB', 'yr_wk')]
+
+# Remove NA and INF weights
+# index of sequences to be excluded b/c of invalid weights
+invalid_weight <- is.na(dat$weight) | is.infinite(dat$weight)
+
+# remove sequences excluded b/c of invalid weights
+dat <- subset(x = dat,
+              !invalid_weight)
+
+
+## Survey Design & Weight Trimming ---------------------------------------------
+
+# Define the data date and the week of the data
+data_date <- as.Date('2023-05-13')
+current_week <- as.numeric(data_date - week0day1) %/% 7
+
+# add the current week to the source data
+dat$current_week <- current_week
+
+# create another column for the variants of interest
+# this is only used to get (unweighted) counts of the sequences by lineage
+dat$VARIANT2 <- as.character(dat$VARIANT)
+# group all non-"variants of interest" together
+dat[dat$VARIANT %notin% voc, "VARIANT2"] <- "Other"
+
+
+# specify survey design 
+svyDES = survey::svydesign(ids     = ~ SOURCE,
+                           strata  = ~ STUSAB + yr_wk,
+                           weights = ~ weight,
+                           nest    = TRUE, # TRUE = disable checking for duplicate cluster ID's across strata
+                           data    = dat)  # not specifying fpc signifies sampling with replacement
+
+# maximum weight; trim weights > 99th percentile
+max_weight <- quantile(x = weights(svyDES),
+                       probs = .99)
+
+# get the minimum (non-0) weight to replace weights of 0
+# weights of 0 can happen if very limited testing data are available for a state
+# in a given week. E.g. if 0 of 2 tests were positive, then any sequences that 
+# came from that state in that week would represent 0 infections. 
+wts <- weights(svyDES)
+min_wt <- min(wts[wts > 0])
+  
+# trim weights using the min & max weights calculated above
+svyDES <- survey::trimWeights(design = svyDES,
+                              upper = max_weight,
+                              lower = min_wt)
+
+# add weights back into the dataframe
+dat$weights = weights(svyDES)
+
+## Center "week" for use in Nowcast multinomial model --------------------------
+
+# final date of data to include in model
+time_end <- '2023-05-13'
+# number of weeks to include in the model
+model_weeks <- 21
+# maximum week included in the model
+model_week_max = as.numeric(as.Date(time_end) - week0day1) %/% 7
+# 1 week before first week included in the model
+model_week_min = model_week_max - model_weeks
+# a midpoint week that will be used to center week values 
+model_week_mid = round(model_weeks/2) # center it around 0 instead of using 1:model_weeks
+# create a dataframe of old and new values to help visualize things
+model_week_df = data.frame(week = 1:model_weeks + model_week_min, # week number (since week0day1)
+                           model_week = 1:model_weeks - model_week_mid, # week number for use in nowcast model
+                           week_start = (1:model_weeks + model_week_min)*7 + as.Date(week0day1), # date of first day of week
+                           week_mid   = (1:model_weeks + model_week_min)*7 + as.Date(week0day1) + 3, # date of midday of week
+                           week_end   = (1:model_weeks + model_week_min)*7 + as.Date(week0day1) + 6) # date of final day of week
+# add the new model_week info to the dataframe
+dat$model_week = dat$week - model_week_min - model_week_mid
+
+# Get the "model_week" of the current week (to be used for making predictions for the current week)
+# (this might be the same as the last week in "model_week_df"; it depends on "time_end")
+data_week_df = data.frame(
+  week       = current_week, 
+  model_week = current_week - model_week_min - model_week_mid,
+  week_start = (data_date - as.numeric(format(data_date, '%w'))),
+  week_mid   = (data_date - as.numeric(format(data_date, '%w'))) + 3,
+  week_end   = (data_date - as.numeric(format(data_date, '%w'))) + 6
+)
+
+# # a function to convert dates to model_week
+# date_to_model_week = function(date){
+#   # fractional week (centered on Wednesday)
+#   week = as.numeric(as.Date(date) - (week0day1+3)) / 7
+#   return(week - model_week_min - model_week_mid)
+# }
+
+
+
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+# Part 3: Calculating Variant Proportions -------------------------------------
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
 # note: "Proportion" and "Share" are used synonymously in this code
 
@@ -1081,208 +1163,199 @@ svycipropkg <- function(formula,
 
 # calculate the variant proportion and confidence interval using survey
 # design for:
-# - weeks  (HHS regions & nationally)
+# - fortnights (HHS regions & nationally)
 
-# subset data to only include data since 2 May, 2021
-# and (end of week) older than "time_end"
-dat2 <- dat[yr_wk >= "2021-05-02" & yr_wk <= (as.Date(time_end) - 6), ]
-    
-# add a column for the date of the final day of each week
-dat2$WEEK_END = as.Date(dat2$yr_wk) + 6
-    
-# get the unique weeks that are in the appropriate time frame
-wks = sort(unique(dat2$yr_wk))
-
-# create a dataframe with variant, time period, and region
-# (and reorder columns for convenience)
-all.wkly = expand.grid(Variant = voc,
-                       Week_of = wks,
+# get the relevant fortnights from the data
+ftnts = sort(unique(dat$FORTNIGHT_END))# create a dataframe with all unique combinations of variants, fortnights, and regions
+# create a dataframe with all unique combinations of variants, fortnights, and regions
+# (and then reverse column order for convenience)
+all.ftnt = expand.grid(Variant = voc,
+                       Fortnight_ending = ftnts,
                        USA_or_HHSRegion = c("USA", 1:10))[, 3:1]
 
-# get predictions & CI for each variant in each week and region
-ests = apply(X = all.wkly,
-             MARGIN = 1,
-             FUN = function(rr) myciprop(voc   = rr[3],
-                                         geoid = rr[1],
-                                         svy   = subset(svyDES, yr_wk == rr[2]),
-                                         str   = FALSE))
+# Define a function to calculate the proportion estimates & CI
+all_ftnt_ests_function <- function(all.ftnt, svyDES){
+  # calculate estimates with 95% CI
+  ests <- apply(X = all.ftnt,
+                MARGIN = 1,
+                FUN = function(rr) myciprop(voc   = rr[3],
+                                            geoid = rr[1],
+                                            svy = subset(x = svyDES,
+                                                          FORTNIGHT_END == rr[2]),
+                                            str = FALSE,
+                                            level = 0.95))
+  return(ests)
+} # end all_ftnt_ests_function definition
 
-# add the predictions into the dataframe
-all.wkly = cbind(all.wkly,
-                 Share    = ests[1,],
-                 Share_lo = ests[2,],
-                 Share_hi = ests[3,],
-                 DF       = ests[4,],
-                 eff.size = ests[5,],
-                 cv.mean  = ests[6,])
+# calculate weighted proportions (in each fortnight & region) for lineages listed in "voc"
+ests <- all_ftnt_ests_function(all.ftnt = all.ftnt, svyDES = svyDES)
 
-# get predictions for the non-focal ("other") variants grouped together
-# (and reorder columns for convenience)
-others = expand.grid(Variant = "Other",
-                     Week_of = wks,
+# add in the estimates to the dataframe
+all.ftnt = cbind(all.ftnt,
+                Share    = ests[1,],
+                Share_lo = ests[2,],
+                Share_hi = ests[3,],
+                DF       = ests[4,],
+                eff.size = ests[5,],
+                cv.mean  = ests[6,],
+                deff     = ests[7,])
+
+# make predictions for the "other" variants (following the same steps)
+others = expand.grid(Variant          = "Other",
+                     Fortnight_ending = ftnts,
                      USA_or_HHSRegion = c("USA", 1:10))[, 3:1]
 
-# get predictions & CI for "other" (grouped) variant in each week and region
-ests.others = apply(X = others,
-                    MARGIN = 1,
-                    FUN = function(rr) myciprop(voc = voc,
-                                                geoid = rr[1],
-                                                svy = subset(svyDES, yr_wk == rr[2]),
-                                                str =  FALSE))
+# function to get the proportion estimates & CI (for "other" variants)
+others_ftnt_ests_function <- function(others, svyDES){
+  # calculate estimates with 95% CI
+  ests.others = apply(X = others,
+                      MARGIN = 1,
+                      FUN = function(rr) myciprop(voc = voc, # "Other" isn't in the Nowcast model; if voc is a vector, myciprop will return the aggregated proportion. So feed in all the vocs, then subtract from 1 to get "Other" estimates.
+                                                  geoid = rr[1],
+                                                  svy = subset(svyDES,
+                                                              FORTNIGHT_END == rr[2]),
+                                                  str = FALSE,
+                                                  level = 0.95))
 
-# add the predictions into the dataframe
+  return(ests.others)
+} # end others_ftnt_ests_function definition
+
+# calculate the proportion of "other" variant in each fortnight & region
+ests.others <- others_ftnt_ests_function(others = others, svyDES = svyDES)
+
+# add in the estimates to the dataframe (for "other" variants)
 others = cbind(others,
                Share    = 1-ests.others[1,],
                Share_lo = 1-ests.others[3,],
                Share_hi = 1-ests.others[2,],
                DF       = ests.others[4,],
                eff.size = ests.others[5,],
-               cv.mean  = ests.others[6,])
+               cv.mean  = ests.others[6,],
+               deff     = ests.others[7,])
 
-# combine estimates for individual variants with the estimates for the "other"
-# (grouped) variants
-all.wkly = rbind(all.wkly,
+# combine the estimates for the vocs with the estimates for "other" variants
+all.ftnt = rbind(all.ftnt,
                  others)
 
-# Add a column for the last day of each week
-all.wkly$WEEK_END = as.Date(all.wkly$Week_of) + 6
-
-
-## generate sequence counts by lineage, location and date
-# raw counts of each variant in each week and each region
-raw_counts_REG <- aggregate(count ~ VARIANT2 + WEEK_END + HHS,
-                            data = dat2,
+# create a table of counts by variant, time period, and HHS region
+raw_counts_REG <- aggregate(count ~ VARIANT2 + FORTNIGHT_END + HHS,
+                            data = dat,
                             FUN  = sum,
-                            drop = FALSE)
+                            drop = FALSE) # drop = FALSE: keep all combinations, even if no observations
 
-# convert region names to character
+# convert HHS region to character
 raw_counts_REG$HHS <- as.character(raw_counts_REG$HHS)
 
-# raw counts for each variant in each week nationally
-raw_counts_US <- aggregate(count ~ VARIANT2 + WEEK_END,
-                           data = dat2,
+# create a table of counts by variant and time period for the whole US
+raw_counts_US <- aggregate(count ~ VARIANT2 + FORTNIGHT_END,
+                           data = dat,
                            FUN  = sum,
                            drop = FALSE)
 
-# add in a column for HHS region = "USA"
+# add a column for HHS region
 raw_counts_US <- cbind(raw_counts_US[,1:2],
-                       HHS   = "USA",
-                       count = raw_counts_US$count)
+                       HHS = "USA",
+                       count = raw_counts_US[,3])
 
-# combine the regional counts with the national counts
+# combine dataframe of counts by region with dataframe of counts for US
 raw_counts <- rbind.data.frame(raw_counts_US,
                                raw_counts_REG)
 
-# merge sequence counts with weighted proportions estimates
-all.wkly2 <- merge(x = all.wkly,
+# merge weighted proportions estimates with sequence counts
+all.ftnt2 <- merge(x = all.ftnt,
                    y = raw_counts,
                    by.x = c("USA_or_HHSRegion",
-                            "WEEK_END",
+                            "Fortnight_ending",
                             "Variant"),
                    by.y = c("HHS",
-                            "WEEK_END",
+                            "FORTNIGHT_END",
                             "VARIANT2"),
-                   all = T)
+                   all.x = T)
 
-# Set counts to 0 if current count is NA and variant != "Other"
-all.wkly2[is.na(all.wkly2$count)==T ,"count"] <- 0
+# replace NA counts with 0
+all.ftnt2[is.na(all.ftnt2$count)==T, "count"] <- 0
 
-# calculate denominator counts
-# (i.e. raw counts per region & week)
-dss <- aggregate(count ~ USA_or_HHSRegion + WEEK_END,
-                 data = all.wkly2,
+#calculate denominator counts by region & time period
+dss <- aggregate(count ~ USA_or_HHSRegion + Fortnight_ending,
+                 data = all.ftnt2,
                  FUN  = sum)
 
-# change name of denominator counts
+# change the names of the "count" column
 names(dss)[grep("count",names(dss))] <- "denom_count"
 
-# add denominator counts into the dataframe of raw counts
-all.wkly2 <- merge(x = all.wkly2,
+# add the denominator counts into the dataframe of results
+all.ftnt2 <- merge(x = all.ftnt2,
                    y = dss)
 
-#calculate absolute CI width
-all.wkly2$CI_width = all.wkly2$Share_hi - all.wkly2$Share_lo
+#set the Share 0 and CI limits to NA when the count for a lineage is 0
+all.ftnt2$Share = ifelse(test = all.ftnt2$Share != 0 & all.ftnt2$count == 0,
+                         yes = 0,
+                         no = all.ftnt2$Share)
+all.ftnt2$Share_lo = ifelse(test = is.na(all.ftnt2$Share_lo) == F & all.ftnt2$count == 0,
+                            yes = NA,
+                            no = all.ftnt2$Share_lo)
+all.ftnt2$Share_hi = ifelse(test = is.na(all.ftnt2$Share_hi) == F & all.ftnt2$count==0,
+                            yes = NA,
+                            no = all.ftnt2$Share_hi)
 
-#set the Share (i.e. Proportion) to 0 and CI limits to NA when the count for a lineage is 0
-all.wkly2$Share=ifelse(all.wkly2$Share!=0 & all.wkly2$count==0,0,all.wkly2$Share)
-all.wkly2$Share_lo=ifelse(is.na(all.wkly2$Share_lo)==F & all.wkly2$count==0,NA,all.wkly2$Share_lo)
-all.wkly2$Share_hi=ifelse(is.na(all.wkly2$Share_hi)==F & all.wkly2$count==0,NA,all.wkly2$Share_hi)
+# calculate absolute CI width
+all.ftnt2$CI_width = all.ftnt2$Share_hi - all.ftnt2$Share_lo
 
 ## generate NCHS flags indicating the reliability of the estimates
 # see https://www.cdc.gov/nchs/data/series/sr_02/sr02_175.pdf
 # flag estimates with Degrees of Freedom < 8
-all.wkly2$flag_df = ifelse(test = all.wkly2$DF < 8,
-                           yes = 1,
-                           no = 0)
+all.ftnt2$flag_df = as.numeric(all.ftnt2$DF < 8)
 # flag estimates with effective size of < 30 (or NA)
-all.wkly2$flag_eff.size = ifelse(test = all.wkly2$eff.size < 30 |
-                                   is.na(all.wkly2$eff.size) == T,
+all.ftnt2$flag_eff.size = ifelse(test = all.ftnt2$eff.size < 30 |
+                                   is.na(all.ftnt2$eff.size) == T,
                                  yes = 1,
                                  no = 0)
 # flag estimates with "denominator count" of < 30 (or NA)
 # (denominator = count of sequences of all variants in a given region and time period)
-all.wkly2$flag_dss = ifelse(test = all.wkly2$denom_count < 30|
-                              is.na(all.wkly2$denom_count) == T,
+all.ftnt2$flag_dss = ifelse(test = all.ftnt2$denom_count < 30 |
+                              is.na(all.ftnt2$denom_count) == T,
                             yes = 1,
                             no = 0)
 # flag estimates with wide (absolute) confidence intervals
-all.wkly2$flag_abs.ciw = ifelse(test = all.wkly2$CI_width > 0.30 |
-                                  is.na(all.wkly2$CI_width) == T,
+all.ftnt2$flag_abs.ciw = ifelse(test = all.ftnt2$CI_width > 0.30 |
+                                  is.na(all.ftnt2$CI_width) == T,
                                 yes = 1,
                                 no = 0)
 # flag estimates with wide (relative) confidence intervals
-all.wkly2$flag_rel.ciw = ifelse(test = ((all.wkly2$CI_width/all.wkly2$Share)*100) > 130 |
-                                  is.na((all.wkly2$CI_width/all.wkly2$Share)*100) == T,
+all.ftnt2$flag_rel.ciw = ifelse(test = ((all.ftnt2$CI_width/all.ftnt2$Share)*100) > 130 |
+                                  is.na((all.ftnt2$CI_width/all.ftnt2$Share)*100) == T,
                                 yes = 1,
                                 no = 0)
 
 # Single identifier for observations that have *any* NCHS flag
-all.wkly2$nchs_flag = ifelse(test = all.wkly2$flag_df == 1 |
-                               all.wkly2$flag_eff.size == 1 |
-                               all.wkly2$denom_count == 1 |
-                               all.wkly2$flag_abs.ciw == 1 |
-                               all.wkly2$flag_rel.ciw == 1,
+all.ftnt2$nchs_flag = ifelse(test = all.ftnt2$flag_df == 1 |
+                               all.ftnt2$flag_eff.size == 1 |
+                               all.ftnt2$denom_count == 1 |
+                               all.ftnt2$flag_abs.ciw == 1 |
+                               all.ftnt2$flag_rel.ciw == 1,
                              yes = 1,
                              no = 0)
 # Single identifier for observations that have any NCHS flag *other* than the
 # degrees of freedom flag.
-all.wkly2$nchs_flag_wodf = ifelse(all.wkly2$flag_eff.size == 1 |
-                                    all.wkly2$denom_count == 1 |
-                                    all.wkly2$flag_abs.ciw == 1 |
-                                    all.wkly2$flag_rel.ciw == 1,
+all.ftnt2$nchs_flag_wodf = ifelse(test = all.ftnt2$flag_eff.size == 1 |
+                                    all.ftnt2$denom_count == 1 |
+                                    all.ftnt2$flag_abs.ciw == 1 |
+                                    all.ftnt2$flag_rel.ciw == 1,
                                   yes = 1,
                                   no = 0)
 
-# select the columns to save
-all.wkly2 = all.wkly2[,c("USA_or_HHSRegion",
-                         "WEEK_END",
-                         "Variant",
-                         "Share",
-                         "Share_lo",
-                         "Share_hi",
-                         "count",
-                         "denom_count",
-                         "DF",
-                         "eff.size",
-                         "CI_width",
-                         "nchs_flag",
-                         "nchs_flag_wodf")]
+# write results to file
+write.csv(x = all.ftnt2,
+          file = 'fortnightly_weighted_proportions.csv',
+          row.names = FALSE)
 
-# sort by HHS region
-all.wkly2 <- all.wkly2[order(all.wkly2$USA_or_HHSRegion),]
-
-# save the results to file
-write.csv(
-  x = all.wkly2,
-  file = "variant_share_weekly_weighted.csv",
-  row.names = FALSE
-)
 
 ## Nowcast Variant Proportions --------------------------------------------------
 
 ### Prep ------------------------------------------------------------------------
 
-# Model is fit to n_top variants that have the largest weighted variant proportions
+# Nowcast model includes all variants listed in "voc" and also the "n_top"
+# variants that have the largest weighted variant proportions
 n_top = 10 
 
 # define n_top variants over n_recent_weeks
@@ -1299,10 +1372,10 @@ us_var = sort(
 us_rank = names(us_var)
 
 # variants to include in the nowcast model
-# Can use those in n_top or in voc
+# (variants are only included if they were observed during "n_recent_week")
 model_vars = us_rank[us_rank %in% c(us_rank[1:n_top], voc)]
-# or can just use voc
-model_vars = voc
+# or can just use voc (as long as all voc are in model data)
+model_vars = voc[voc %in% dat[ model_week %in% ((1:model_weeks)-model_week_mid)][['VARIANT']] ]
 
 # add variant ranks to dat
 # makes sure each seq is assigned a rank/number based on the weighted proportion
@@ -1315,7 +1388,7 @@ dat$K_US <- match(x = dat$VARIANT, table = model_vars)
 # which will correspond to "Other"
 dat$K_US[is.na(dat$K_US)] = length(model_vars) + 1
 
-#create a subset of src.dat that only contains the weeks that will be included
+#create a subset of dat that only contains the weeks that will be included
 # in multinomial model
 moddat = subset(dat,
                 model_week %in% ((1:model_weeks)-model_week_mid))
@@ -1331,7 +1404,7 @@ mysvy = survey::svydesign(ids     = ~ SOURCE,
                           data = moddat) # not specifying fpc signifies sampling with replacement
 
 ### Fit Nowcast models ---------------------------------------------------------
-# Fit the nowcast model using the svymultinom function
+# Fit the nowcast model for regional estimates using the svymultinom function
 svymlm_hhs = svymultinom(mod.dat = moddat,
                          mysvy   = mysvy,
                          fmla    = formula("as.numeric(as.factor(K_US)) ~ model_week + as.factor(HHS)"), 
@@ -1345,42 +1418,122 @@ svymlm_us = svymultinom(mod.dat = moddat,
 
 ### Aggregate results ----------------------------------------------------------
 
-# optionally aggregate Delta's AY sublineages for results
-# Check to see which AY lineages are in model_vars
-AY_agg = model_vars[grep("AY", model_vars)]
-
-# all variants to be aggregated into the "other" category
-Other_agg = model_vars[model_vars %notin% voc]
-
 # generate a matrix that indicates which lineages to aggregate for the nowcast
-# Columns are the lineages in the nowcast model, so all the defined lineages
-#  plus the "other" lineage
-# Rows are the aggregated lineages wanted
+# Columns are the lineages in the nowcast model
+# Rows are the aggregated lineages for output
+# a 1 in any cell indicates that the variant indicated by the column should be 
+# aggregated into the aggregate indicated by the row.
+
+# Specify the lineages to output (must be a subset of "voc")
+output_lineages = model_vars[model_vars %in% voc]
+
+# create an empty aggregation matrix with a column for each voc in the model (plus "OTHER")
 agg_var_mat <- matrix(data = 0,
-                      nrow = 2,
+                      nrow = 0,
                       ncol = (length(model_vars)+1))
+# specify the column names
 colnames(agg_var_mat) <- c(model_vars,"Other")
 
-# Fill in matrix values: if lineage is to be aggregated to parent lineage in
-# given row, then value = 1, else value = 0
-agg_var_mat[1,] <- ifelse(colnames(agg_var_mat) %in% c("B.1.617.2", AY_agg),1,0)
-agg_var_mat[2,] <- ifelse(colnames(agg_var_mat) %in% c(Other_agg, "Other"),1,0)
-row.names(agg_var_mat) <-c("Delta Aggregated", "Other Aggregated")
+# get the lineage_expanded for the model_vars
+model_vars_expanded <- setNames(voc_lut$lineage_expanded, voc_lut$variant)[ model_vars ]
 
-# dates for which to make predictions using the nowcast model
-prediction_dates = seq.Date(from = as.Date('2021-11-01'),
-                            to = as.Date('2022-01-15'),
-                            by = 1)
+# potential parent variants are output_lineages_expanded
+output_lineages_expanded <- setNames(voc_lut$lineage_expanded, voc_lut$variant)[ output_lineages ]
+
+# get the parent varients for the model_vars_expanded from the output_lineages_expanded
+model_var_parents_expanded <- nearest_parent( model_vars_expanded,  output_lineages_expanded )
+# get the short names for the parent variants of model_vars
+model_var_parents <- setNames( voc_lut$variant, voc_lut$lineage_expanded )[ model_var_parents_expanded ]
+
+# model_var look-up table
+model_var_lut <- data.frame(
+model_vars = model_vars,
+output_model_vars = model_var_parents
+)
+
+# only need to convert rows where model_vars != output_model_vars
+mvl_sub <- model_var_lut[ model_var_lut$model_vars != model_var_lut$output_model_vars, ]
+
+# get the names of the parent variants that will have sub-lineages aggregated into them
+unique_mvl_sub <- unique(mvl_sub$output_model_vars)
+
+# for each unique mvl_sub$output_model_vars, fill in values in the matrix for the variants that will be aggregated into it.
+for (i in unique_mvl_sub) {
+
+    # define an extra row to add onto the agg_var_mat
+    extra_row <- ifelse( colnames(agg_var_mat) %in%
+                            # the variant itself & all the sub-lineages to be aggregated into it
+                            c(i, model_var_lut[ model_var_lut$output_model_vars == i, 'model_vars']) ,
+                            1,
+                            0)
+
+    # add the new row onto the aggregation matrix
+    agg_var_mat <- rbind(
+        agg_var_mat,
+        extra_row
+    )
+    # give the new row a row name
+    row.names(agg_var_mat)[nrow(agg_var_mat)] <- paste(i, 'Aggregated')
+} # end loop over unique_mvl_sub
+
+# all the variants (not in output_lineages) AND (not aggregated into something else)
+# should be aggregated into "Other Aggregated"
+other_agg <- base::setdiff(colnames(agg_var_mat)[colSums(agg_var_mat) == 0],
+                            output_lineages)
+# add the new row (for "Other Aggregated") onto the aggregation matrix
+agg_var_mat <- rbind(
+    agg_var_mat,
+    ifelse(colnames(agg_var_mat) %in% other_agg, 1, 0)
+)
+# update the row name
+row.names(agg_var_mat)[nrow(agg_var_mat)] <- 'Other Aggregated'
+
+# double-check that no variant is aggregated into multiple vocs
+if(max(colSums(agg_var_mat)) > 1){
+warning(message = paste(
+    'Aggregated results are invalid! These variants are being aggregated multiple times:',
+    names(agg_var_mat)[colSums(agg_var_mat) > 1],
+    '. Fix the aggregation matrix.'))
+}
+
+# NOTE! Setting up the agg_var_mat in this way assumes that variants included in
+# model_vars but NOT in voc (i.e: setdiff(model_vars, voc) ) will be aggregated into something
+# that IS in voc (other than "Other Aggregated"). This is necessary to ensure that the
+# "Other Aggregated" row is the SAME for the weighted estimates and the Nowcast estimates
+# this is a check to make sure that the assumption stated above is being met.
+sub_mat <- agg_var_mat[row.names(agg_var_mat) != 'Other Aggregated',setdiff(model_vars, voc), drop = FALSE]
+if(!all(colSums(sub_mat) > 0)){
+    problem_vocs <- colnames(sub_mat)[colSums(sub_mat) == 0]
+    warning(message = paste0('Not all variants in "model_vars" are aggregated into something in "voc". ',
+                                paste(problem_vocs, collapse = ', '),
+                                ' is in model_vars but is not aggregated into anything in voc. Therefore Nowcast & weighted estimates will differ!'))
+}
+
+# print a warning if any columns have totals > 1
+if(any(colSums(agg_var_mat)>1)) warning(paste0('agg_var_mat not correctly specified. Some variants are aggregated more than once.', agg_var_mat))
+
+
+### Fortnightly estimates -----
+#define fortnights and regions to get nowcasts for
+# use the final 2 weeks of observed data
+proj_ftnts = as.Date(tail(ftnts, 2))
+# and add on 2 fortnights into the future
+proj_ftnts = sort(unique(c(proj_ftnts,
+                            proj_ftnts + 14,
+                            proj_ftnts + 28)))
+
+# create a dataframe with all regions for predictions
+dfs = expand.grid(USA_or_HHSRegion = c("USA", as.character(1:10)))
 
 # create an empty object to hold predicted values for each region
-proj.res <- c()
+proj.res = c()
 
 # cycle over regions
-for (rgn in c('USA', 1:10)){
-  # cycle over dates
-  for (pd in prediction_dates) {
-    
-    # get the model fit & geoid
+for (rgn in dfs$USA_or_HHSRegion){
+  # cycle over time period
+  for (ftn in proj_ftnts) {
+
+    # get the model fit object & geiod
     if (rgn=="USA") {
       mlm   = svymlm_us$mlm
       geoid = rgn
@@ -1388,300 +1541,166 @@ for (rgn in c('USA', 1:10)){
       mlm   = svymlm_hhs$mlm
       geoid = as.numeric(rgn)
     }
-    
-    # get the week for the given timepoint
-    wk_date = as.Date(pd, origin="1970-01-01")
-    wk_num  = as.numeric(wk_date - week0day1) / 7
-    # convert to model_week
-    wk      = wk_num - model_week_min - model_week_mid
+
+    # get the timepoint to use for predictions for each fortnight
+    # (use the midpoint of each fortnight, and convert to the same unit of time as is used in the model)
+    wk = as.numeric(as.Date(ftn, origin="1970-01-01") - (week0day1+3) - 6.5) / 7
+    # convert week to model_week
+    wk = wk - model_week_min - model_week_mid
     
     # get the estimates (and SE) for the given place & time
     ests = se.multinom(mlm = mlm,
-                       week = wk,
-                       geoid = geoid,
-                       composite_variant = agg_var_mat)
-    
-    # calculate the SE of the estimated growth rate
+                        newdata_1row = data.frame(
+                          model_week = wk,
+                          HHS = geoid
+                        ),
+                        composite_variant = agg_var_mat)
+
+    # calculate the growth rate
+    #   "growth rate" here is the derivative (i.e. slope) of the predicted proportion
+    #   hence, it is an instantaneous rate of change. 
+    #   multinomial model estimated proportion of variant i at time t:  p_i(t) = exp(b_0i + b_1i * t) / sum_j(exp(b_0j + b_1j * t)), where j is all the variants in the model
+    #   the derivative of the log of this function is: dlog(p_i(t))/dt = b_1i - sum_j(p_j(t) * b_1j)
+    #   then we convert back to the response scale by taking the exponent, 
+    #   convert from a fraction to a percent by multiplying by 100
+    #   and subtract 100 so that "no change" is 0 instead of (100 percent of current value)
+    #   A growth rate of 50 means that the instantaneous rate of change of the 
+    #   estimated proportion is a 50% increase over 1 week (the unit of time in the model is week).
+    #   The growth rates are not constant through time. A variant with a proportion of 50% and
+    #   a growth rate of 50% will not reach 75% after one week. It would if the instantaneous 
+    #   growth rate were maintained for the full week, but growth rates typically decline with time.
+    gr = with(ests,
+              100 * exp(b_i - sum(p_i * b_i)) - 100)
+
+    # calculate the SE of the growth rate
     se.gr = with(data = ests,
-                 expr = 100 * exp(sqrt(se.b_i^2 + sum(se.p_i^2 * b_i^2 + p_i^2 * se.b_i^2))) - 100)
+                  expr = 100 * exp(sqrt(se.b_i^2 * (1 - 2 * p_i) + sum(se.p_i^2 * b_i^2 + p_i^2 * se.b_i^2))) - 100)
     # p_i    = predicted probability (proportional representation/frequency)
     # se.p_i = SE of predicted frequency
     # b_i    = coefficient value (for intercept & week)
     # se.b_i = SE of coefficient value
-    
-    # calculate the estimated growth rate
-    # here "growth rate" = week-over-week growth of log odds
-    gr = with(data = ests,
-              expr = 100 * exp(b_i - sum(p_i * b_i)) - 100)
-    
-    # Get approximate 95% confidence intervals for growth rate
+
+    # calculate growth rates without rescaling (to use for doubling times & confidence intervals)
     se.gr_link = with(data = ests,
-                      expr = sqrt(se.b_i^2 + sum(se.p_i^2 * b_i^2 + p_i^2 * se.b_i^2)))
+                      expr = sqrt(se.b_i^2 * (1 - 2 * p_i) + sum(se.p_i^2 * b_i^2 + p_i^2 * se.b_i^2)))
     gr_link = with(data = ests,
-                   expr = (b_i - sum(p_i * b_i)))
+                  expr = (b_i - sum(p_i * b_i)))
     gr_lo_link = gr_link - 1.96 * se.gr_link
     gr_hi_link = gr_link + 1.96 * se.gr_link
+
     gr_lo = 100 * exp(gr_lo_link) - 100
     gr_hi = 100 * exp(gr_hi_link) - 100
-      
-    # calculate doubling time (doubling time of log odds in days)
+
+    # calculate doubling time (multiply by 7 to convert weeks to days)
     doubling_time    = log(2)/gr_link * 7
     doubling_time_lo = log(2)/gr_lo_link * 7
     doubling_time_hi = log(2)/gr_hi_link * 7
-    
-    
+
+    # empty dataframe to store growth rates (and doubling times) for aggregated variants
+    gr_agg <- data.frame( variant = rownames(agg_var_mat),
+                          gr    = NA,
+                          se.gr = NA,
+                          gr_lo = NA,
+                          gr_hi = NA,
+                          dt    = NA,
+                          dt_lo = NA,
+                          dt_hi = NA)
+    # extract the growth rates for the aggregated variants
+    for(r in 1:nrow(agg_var_mat)){
+      # if nothing is actually being aggregated, just get the growth rate of the individual component
+      if(unname(rowSums(agg_var_mat)[r]) == 1){
+        col_ind <- which(agg_var_mat[r,]>0)
+        gr_agg[r,'gr']    <- gr[col_ind]
+        gr_agg[r,'se.gr'] <- se.gr[col_ind]
+        gr_agg[r,'gr_lo'] <- gr_lo[col_ind]
+        gr_agg[r,'gr_hi'] <- gr_hi[col_ind]
+        gr_agg[r,'dt']    <- doubling_time[col_ind]
+        gr_agg[r,'dt_lo'] <- doubling_time_lo[col_ind]
+        gr_agg[r,'dt_hi'] <- doubling_time_hi[col_ind]
+      } else {
+        # if there are component variants, then take the weighted mean (weighted by estimated proportion) to get the aggregated growth rate
+        col_ind <- unname(which(agg_var_mat[r,]>0))
+        gr_agg[r,'gr']    <- sum(   gr[col_ind] * ests$p_i[col_ind]) / sum(ests$p_i[col_ind])
+        gr_agg[r,'gr_lo'] <- sum(gr_lo[col_ind] * ests$p_i[col_ind]) / sum(ests$p_i[col_ind])
+        gr_agg[r,'gr_hi'] <- sum(gr_hi[col_ind] * ests$p_i[col_ind]) / sum(ests$p_i[col_ind])
+        gr_agg[r,'dt']    <- sum(   doubling_time[col_ind] * ests$p_i[col_ind]) / sum(ests$p_i[col_ind])
+        gr_agg[r,'dt_lo'] <- sum(doubling_time_lo[col_ind] * ests$p_i[col_ind]) / sum(ests$p_i[col_ind])
+        gr_agg[r,'dt_hi'] <- sum(doubling_time_hi[col_ind] * ests$p_i[col_ind]) / sum(ests$p_i[col_ind])
+      }
+    }
+
     # format estimates into dataframe with relevant info
-    ests_df = data.frame(
+    ests = data.table::data.table(
+      # region
       USA_or_HHSRegion = rgn,
-      DATE = as.Date(pd,
-                     origin="1970-01-01"),
+      # fortnight
+      Fortnight_ending = as.Date(ftn, origin="1970-01-01"),
+      # all the variants
       Variant = c(model_vars,
                   "Other",
                   row.names(ests$composite_variant$matrix)),
+      # all the estimated proportions
       Share = c(ests$p_i,
                 ests$composite_variant$p_i),
+      # SE of estimated proportions
       se.Share = c(ests$se.p_i,
-                   ests$composite_variant$se.p_i),
-      growth_rate = c(gr,
-                      rep(NA, length(ests$composite_variant$p_i))),
-      se.growth_rate = c(se.gr,
-                         rep(NA, length(ests$composite_variant$p_i))),
-      growth_rate_lo = c(gr_lo,
-                         rep(NA, length(ests$composite_variant$p_i))),
-      growth_rate_hi = c(gr_hi,
-                         rep(NA, length(ests$composite_variant$p_i))),
-      doubling_time = c(doubling_time,
-                        rep(NA, length(ests$composite_variant$p_i))),
-      doubling_time_lo = c(doubling_time_lo,
-                           rep(NA, length(ests$composite_variant$p_i))),
-      doubling_time_hi = c(doubling_time_hi,
-                           rep(NA, length(ests$composite_variant$p_i)))
+                  ests$composite_variant$se.p_i),
+      # all the estimated growth rates (and CI)
+      growth_rate    = c(gr,    gr_agg$gr),
+      growth_rate_lo = c(gr_lo, gr_agg$gr_lo),
+      growth_rate_hi = c(gr_hi, gr_agg$gr_hi),
+      # all the estimated doubling times (and CI)
+      doubling_time    = c(doubling_time,    gr_agg$dt),
+      doubling_time_lo = c(doubling_time_lo, gr_agg$dt_lo),
+      doubling_time_hi = c(doubling_time_hi, gr_agg$dt_hi)
     )
-    
-    # Get binomial CI from p_i and se.p_i
-    binom.ci = apply(X = ests_df,
-                     MARGIN = 1 ,
-                     FUN = function(rr) svyCI(p = as.numeric(rr[4]),
-                                              s = as.numeric(rr[5])))
+
+    # Get binomial CI using the estimated proportion & SE
+    binom.ci = apply(X = ests,
+                    MARGIN = 1,
+                    FUN = function(rr) svyCI(p = as.numeric(rr[4]),
+                                             s = as.numeric(rr[5]), 
+                                             conf.level = 0.95))
+
     # add the CI into the estimates dataframe
-    ests_df$Share_lo = binom.ci[1,]
-    ests_df$Share_hi = binom.ci[2,]
-    
+    ests$Share_lo = binom.ci[1,]
+    ests$Share_hi = binom.ci[2,]
+
     # add the estimates for this specific place & time to the results
     proj.res = rbind(proj.res,
-                     ests_df)
-  } # end loop over weeks
+                    ests)
+  } # end loop over fortnights
 } # end loop over regions
 
-# In example code, "Delta Aggregated" = B.1.617.2 and AY.103 combined
-# save results
-write.csv(x = proj.res,
-          file = "nowcast_weekly.csv",
-          row.names = FALSE)
+# Extract and save the results for the aggregated variants (as specified in agg_var_mat)
+# exclude variants that have been aggregated into other groups (i.e. have value > 0 in the matrix)
+agg_lineages <- colnames(agg_var_mat)[colSums(agg_var_mat)>0]
+if("Other" %notin% agg_lineages) agg_lineages <- c(agg_lineages, "Other Aggregated")
+# get the results that were not aggregated into something else
+results_agg = proj.res[Variant %notin% agg_lineages]
 
+# double-check that the proportions add up to 1 each time period
+if (!all(results_agg[, .(total_share = sum(Share)), by = c('USA_or_HHSRegion', 'Fortnight_ending')][,unique(round(total_share, 5))] == 1)){
+  warning('The total proportion does not add up to 100% in each time period!')
+} else {
+  # save the results to file
+  write.csv(x = results_agg,
+            file = 'fortnightly_nowcast_proportions_aggregated.csv',
+            row.names = FALSE)
+}
 
-## Jurisdictional estimates ----------------------------------------------------
-# this is very similar to the Weighted Variant Share estimates above, but instead
-# of producing estimates for each week, estimates are made for rolling 4-week bins
-# b/c sample sizes from individual state-week combinations are often too small
-# to produce estimates for every week for every state
+# Extract and save the results for all model_vars (i.e. exclude the aggregated variants)
+# exclude the lineages that were aggregated (other than "Other")
+drop_lin <- row.names(agg_var_mat)[row.names(agg_var_mat) %notin% "Other Aggregated"]
 
-# Last date of data that gets included in jurisdictional estimates
-# typically exclude the most recent 2 weeks of data b/c of delay in sequencing & 
-# reporting samples
-current_day <- as.Date('2022-01-03')
-# current date = date that data were compiled
+# Only include variants that are NOT in the list provided
+results_nonagg = proj.res[Variant %notin% c(drop_lin, "Other", colnames(agg_var_mat['Other Aggregated',,drop=F])[agg_var_mat['Other Aggregated',,drop=F] > 0])]
 
-# 2 weeks to use as end dates for rolling 4-week bins
-state_time_end = (current_day - as.numeric(format(current_day, '%w'))) - 15 - 0:1*(7)
-
-# get the week number that corresponds to each date defined in state_time_end
-data_weeks <- as.numeric(state_time_end - week0day1) %/% 7
-
-# all combinations of states, 4-wk periods, & variants
-# (reverse column order for convenience)
-all.state = expand.grid(Variant = voc,
-                        Roll_4wk_end = data_weeks,
-                        State = sort(unique(dat$STUSAB)))[, 3:1]
-
-# calculate estimated proportions (and CI) using survey design
-ests = apply(X = all.state,
-             MARGIN = 1,
-             FUN = function(rr) myciprop(voc = rr[3],
-                                         geoid = rr[1],
-                                         svy = subset(svyDES,
-                                                      week >= (as.numeric(rr[2]) - 3) &
-                                                        week < (as.numeric(rr[2]) + 1)),
-                                         str = FALSE))
-
-# add together the combinations of states, time period, & variants with estimates
-all.state = cbind(all.state,
-                  Share    = ests[1,],
-                  Share_lo = ests[2,],
-                  Share_hi = ests[3,],
-                  DF       = ests[4,],
-                  eff.size = ests[5,],
-                  cv.mean  = ests[6,])
-
-# all combinations of states, 4-wk periods for "Other" variants
-# (column order reversed for convenience)
-others = expand.grid(Variant = "Other",
-                     Roll_4wk_end = data_weeks,
-                     State = sort(unique(dat$STUSAB)))[, 3:1]
-
-# calculate the estimated proportions (and CI) using survey design
-ests.others = apply(X = others,
-                    MARGIN = 1,
-                    FUN = function(rr) myciprop(voc = voc,
-                                                geoid = rr[1],
-                                                svy = subset(svyDES,
-                                                             week >= (as.numeric(rr[2]) - 3) &
-                                                               week < (as.numeric(rr[2]) + 1)),
-                                                str = FALSE))
-
-# add together the combinations of states, time period, & variants with estimates
-others = cbind(others,
-               Share    = 1-ests.others[1,],
-               Share_lo = 1-ests.others[3,],
-               Share_hi = 1-ests.others[2,],
-               DF       = ests.others[4,],
-               eff.size = ests.others[5,],
-               cv.mean  = ests.others[6,])
-
-# combine estimates for individual variants with estimates for "Other" variants
-all.state = rbind(all.state,
-                  others)
-
-# empty object to hold sequence counts
-all.state.out <-c()
-
-# generate sequence counts by lineage, location, & date
-for(i in seq(data_weeks)){
-  
-  # subset the data to the relevant time period
-  dat2 <- dat[dat$week >= (as.numeric(data_weeks[i]) - 3) &
-                dat$week < (as.numeric(data_weeks[i]) + 1),]
-  
-  # raw sample counts by variant & state
-  raw_counts_state <- aggregate(count ~ VARIANT2 + STUSAB,
-                                data = dat2,
-                                FUN  = sum,
-                                drop = FALSE)
-  
-  # set NA counts to 0
-  raw_counts_state$count <- ifelse(test = is.na(raw_counts_state$count) == T,
-                                   yes = 0,
-                                   no = raw_counts_state$count)
-  
-  
-  # merge sequence counts with weighted proportions estimates
-  all.state2 <- merge(x = all.state[all.state$Roll_4wk_end == data_weeks[i],],
-                      y = raw_counts_state,
-                      by.x = c("State",
-                               "Variant"),
-                      by.y = c("STUSAB",
-                               "VARIANT2"),
-                      all = T)
-  
-  # set NA counts to 0 again
-  all.state2[is.na(all.state2$count) == T, "count"] <- 0
-  
-  # calculate denominator counts
-  dss <- aggregate(count ~ State,
-                   data = all.state2,
-                   FUN = sum)
-  
-  # change the column name for the denominator counts
-  names(dss)[grep("count",names(dss))] <- "denom_count"
-  
-  # add the denominator counts into the results dataframe
-  all.state2 <- merge(x = all.state2,
-                      y = dss,
-                      all = T)
-  
-  # add a column for the rolling 4-week period
-  all.state2$Roll_Fourweek_ending <- unique(as.Date(dat$yr_wk[dat$week==data_weeks[i]]) + 6)
-  
-  # add the results for the given time period onto the dataframe of results
-  all.state.out <- rbind.data.frame(all.state.out,
-                                    all.state2)
-} # end loop over weeks
-
-# set the proportion (i.e. Share) to 0 and CI limits to NA when the count for a lineage is 0
-all.state.out$Share = ifelse(test = all.state.out$Share != 0 &
-                               all.state.out$count == 0,
-                             yes = 0,
-                             no = all.state.out$Share)
-all.state.out$Share_lo = ifelse(test = is.na(all.state.out$Share_lo) == F &
-                                  all.state.out$count == 0,
-                                yes = NA,
-                                no = all.state.out$Share_lo)
-all.state.out$Share_hi = ifelse(test = is.na(all.state.out$Share_hi) == F &
-                                  all.state.out$count == 0,
-                                yes = NA,
-                                no = all.state.out$Share_hi)
-
-#calculate absolute CI width
-all.state.out$CI_width = all.state.out$Share_hi - all.state.out$Share_lo
-
-## generate NCHS flags
-# flag estimates with Degrees of Freedom < 8
-all.state.out$flag_df = ifelse(all.state.out$DF<8, 1, 0)
-# flag estimates with effective size of < 30 (or NA)
-all.state.out$flag_eff.size = ifelse(test = all.state.out$eff.size < 30 |
-                                       is.na(all.state.out$eff.size)==T,
-                                     yes = 1,
-                                     no = 0)
-# flag estimates with "denominator count" of < 30 (or NA)
-# (denominator = count of sequences of all variants in a given region and time period)
-all.state.out$flag_dss = ifelse(test = all.state.out$denom_count < 30|
-                                  is.na(all.state.out$denom_count) == T,
-                                yes = 1,
-                                no = 0)
-# flag estimates with wide (absolute) confidence intervals
-all.state.out$flag_abs.ciw = ifelse(test = all.state.out$CI_width > 0.30 |
-                                      is.na(all.state.out$CI_width) == T,
-                                    yes = 1,
-                                    no = 0)
-# flag estimates with wide (relative) confidence intervals
-all.state.out$flag_rel.ciw = ifelse(test = ((all.state.out$CI_width/all.state.out$Share)*100) > 130 |
-                                      is.na((all.state.out$CI_width/all.state.out$Share)*100) == T,
-                                    yes = 1,
-                                    no = 0)
-
-# Single identifier for observations that have *any* NCHS flag
-all.state.out$nchs_flag = ifelse(test = all.state.out$flag_df == 1 |
-                                   all.state.out$flag_eff.size == 1 |
-                                   all.state.out$denom_count == 1 |
-                                   all.state.out$flag_abs.ciw == 1 |
-                                   all.state.out$flag_rel.ciw==1,
-                                 yes = 1,
-                                 no = 0)
-
-# Single identifier for observations that have any NCHS flag *other* than the degrees of freedom flag.
-all.state.out$nchs_flag_wodf = ifelse(test = all.state.out$flag_eff.size == 1 |
-                                        all.state.out$denom_count == 1 |
-                                        all.state.out$flag_abs.ciw == 1 |
-                                        all.state.out$flag_rel.ciw == 1,
-                                      yes = 1,
-                                      no = 0)
-
-# select columns for the final results
-all.state.out = all.state.out[,c("State",
-                                 "Roll_Fourweek_ending",
-                                 "Variant",
-                                 "Share",
-                                 "Share_lo",
-                                 "Share_hi",
-                                 "count",
-                                 "denom_count",
-                                 "DF",
-                                 "eff.size",
-                                 "CI_width",
-                                 "nchs_flag",
-                                 "nchs_flag_wodf")]
-
-# write results to file
-write.csv(x = all.state.out,
-          file = "state_weighted_roll4wk.csv",
-          row.names = FALSE)
+# Double-check that the shares add up to 1 each time period
+if (!all(results_nonagg[, .(total_share = sum(Share)), by = c('USA_or_HHSRegion', 'Fortnight_ending')][,unique(round(total_share, 5))] == 1)){
+  warning('The total proportion does not add up to 100% in each time period!')
+} else {
+  write.csv(x = results_nonagg,
+            file = 'fortnightly_nowcast_proportions.csv',
+            row.names = FALSE)
+}

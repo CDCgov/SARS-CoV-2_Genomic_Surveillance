@@ -1,6 +1,8 @@
 Org: NCIRD/CORVD
 
-Keywords: genomic surveillance, SARS-CoV-2 variants, weighted proportions, nowcasting
+Contact Email: shareit@cdc.gov
+
+Keywords: genomic surveillance, weighted proportions, SARS-CoV-2 variants, nowcasting
 
 # Genomic Surveillance of SARS-CoV-2 Circulating in the United States
 

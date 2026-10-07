@@ -5,10 +5,17 @@
 #
 # Modifications:
 #   1. Estimate period changed from 2 weeks (fortnight) to 4 weeks.
-#   2. Weighted proportion CIs now use prop.test on weighted counts instead
+#   2. Weighted proportion CI
+s now use prop.test on weighted counts instead
 #      of the survey-design-based svycipropkg (Korn-Graubard).
 #   3. All estimates are calculated for the USA only; HHS region estimates
 #      and the regional nowcast model have been removed.
+#   4. The nowcast model's survey-design variance correction has been removed.
+#      Point estimates are unchanged (weighted nnet::multinom fit); standard
+#      errors now come from the model's Hessian-based covariance rather than a
+#      survey-design "sandwich" (see svymultinom in helpers.R). This makes the
+#      nowcast's variance treatment consistent with the prop.test-based
+#      weighted proportions (neither is survey-design-adjusted).
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
 
@@ -137,28 +144,17 @@ proptest_ci <- function(voc,
 
 
 ## ---------------------------------------------------------------------------
-## Nowcast functions (svymultinom, se.multinom, svyCI) -- unchanged from the
-## original code. Bring these in verbatim from variant_surveillance_system.R:
-##   - svymultinom
-##   - se.multinom
-##   - svyCI
-##   - np / nearest_parent
-##   - `%notin%`
+## Shared helper functions.
 ##
-## They're omitted here for brevity. Source the original file or copy them
-## directly. Only the svycipropkg / myciprop functions are no longer needed
-## for the weighted estimates, though svyCI is still used inside the nowcast
-## pipeline.
+## svymultinom, se.multinom, svyCI, np / nearest_parent, and %notin% now live
+## in helpers.R, which both this script and the unit tests source. The version
+## of svymultinom in helpers.R has the survey-design variance correction
+## removed (see CHANGE 4 below): point estimates still come from the weighted
+## nnet::multinom fit, but standard errors are derived from the model's
+## Hessian-based covariance rather than a survey-design "sandwich".
 ## ---------------------------------------------------------------------------
 
-source("variant_surveillance_system.R", local = FALSE,
-       # If you don't want to re-run the original analysis, you can instead
-       # copy just the function definitions (Part 1) into this file.
-       echo = FALSE)
-# NOTE: sourcing the original file will also execute Parts 2 and 3 of the
-# original analysis. If that is not desired, copy just the function block
-# (lines ~1-913 of variant_surveillance_system.R) into this file in place
-# of the source() call above.
+source("helpers.R")
 
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
@@ -168,24 +164,72 @@ source("variant_surveillance_system.R", local = FALSE,
 library(survey)
 library(nnet)
 library(data.table)
+library(optparse)
 
 options(survey.adjust.domain.lonely = TRUE,
         survey.lonely.psu = "average",
         stringsAsFactors = FALSE)
 
+## Command-line arguments ----------------------------------------------------
+# The script accepts an input .RDS file and an output basename. The basename
+# is used as a prefix for the three CSV outputs:
+#     <basename>_weighted_proportions.csv
+#     <basename>_nowcast_proportions_aggregated.csv
+#     <basename>_nowcast_proportions.csv
+# If the basename includes a directory component (e.g. "results/run_2023_05_13"),
+# that directory must already exist.
+#
+# When the script is sourced interactively (not run via Rscript), the parser
+# is skipped and default values are used, preserving the original workflow.
+
+.option_list <- list(
+  optparse::make_option(c("-i", "--input"),
+                        type = "character",
+                        default = "example_data.RDS",
+                        help = "Path to the input .RDS file of sequence data [default: %default]",
+                        metavar = "FILE"),
+  optparse::make_option(c("-o", "--output-basename"),
+                        type = "character",
+                        default = "fourweekly",
+                        help = paste("Basename (optionally including a directory) used as a prefix for",
+                                     "the three CSV outputs [default: %default]"),
+                        metavar = "BASENAME")
+)
+
+# Only invoke the parser when running from the command line. interactive() is
+# TRUE in an R session; commandArgs(trailingOnly = TRUE) is populated by
+# Rscript. This guard lets `Rscript variant_surveillance_modified.R ...` work
+# while leaving `source("variant_surveillance_modified.R")` unaffected.
+if (!interactive() && length(commandArgs(trailingOnly = TRUE)) > 0) {
+  .args <- optparse::parse_args(
+    optparse::OptionParser(option_list = .option_list)
+  )
+  input_file <- .args$input
+  output_basename <- .args$`output-basename`
+} else {
+  input_file <- "example_data.RDS"
+  output_basename <- "fourweekly"
+}
+
+if (!file.exists(input_file)) {
+  stop("Input file not found: ", input_file)
+}
+
 ## Load sequence data ---------------------------------------------------------
-dat <- readRDS(file = "../example/example_data.RDS")
+dat <- readRDS(file = input_file)
 dat$count <- 1
 dat <- data.table::as.data.table(dat)
 
 ## Parameters -----------------------------------------------------------------
 week0day1 <- as.Date("2020-01-05")
 
-voc <- c("BA.1.1", "BA.2", "BA.2.12.1", "BA.2.75", "BA.2.75.2",
-         "CH.1.1", "BF.7", "BF.11", "BA.4", "BA.4.6", "BA.5", "BA.5.2.6",
-         "BQ.1", "BQ.1.1", "BN.1", "XBB", "XBB.1.5", "XBB.1.5.1",
-         "XBB.1.9.1", "FD.2", "XBB.1.9.2", "XBB.1.16", "XBB.2.3",
-         "B.1.617.2", "B.1.1.529")
+#voc <- c("BA.1.1", "BA.2", "BA.2.12.1", "BA.2.75", "BA.2.75.2",
+#         "CH.1.1", "BF.7", "BF.11", "BA.4", "BA.4.6", "BA.5", "BA.5.2.6",
+#         "BQ.1", "BQ.1.1", "BN.1", "XBB", "XBB.1.5", "XBB.1.5.1",
+#         "XBB.1.9.1", "FD.2", "XBB.1.9.2", "XBB.1.16", "XBB.2.3",
+#         "B.1.617.2", "B.1.1.529")
+voc <- c("XGF", "XFG.14.1", "XGF.1.1", "XFG.6", "NB.1.8.1", "PQ.17", "XFV", 
+         "XFZ", "XFY", "B.1.1.529")
 
 ## Aggregate sublineages ------------------------------------------------------
 dat$VARIANT <- dat$lineage <- as.character(dat$VARIANT)
@@ -212,11 +256,10 @@ dat[dat$VARIANT %notin% voc, "VARIANT2"] <- "Other"
 ## Survey weights (unchanged) -------------------------------------------------
 dat[, "proxy_infections" :=
       state_population *
-      sqrt(POSITIVE.HHS.nrevss / TOTAL.HHS.nrevss) *
-      sqrt(POSITIVE.HHS / population_reporting.HHS)]
+      sqrt(POSITIVE.HHS.nrevss / TOTAL.HHS.nrevss)]
 
 dat[, "weight" := proxy_infections / sum(count),
-    by = c("STUSAB", "yr_wk")]
+    by = c("STUSAB", "yr_week")]
 
 invalid_weight <- is.na(dat$weight) | is.infinite(dat$weight)
 dat <- subset(dat, !invalid_weight)
@@ -231,12 +274,12 @@ if (!"FOURWEEK_END" %in% names(dat)) {
 dat$FOURWEEK_END <- as.Date(dat$FOURWEEK_END)
 
 ## Survey design & weight trimming --------------------------------------------
-data_date <- as.Date("2023-05-13")
+data_date <- as.Date("2026-01-08")
 current_week <- as.numeric(data_date - week0day1) %/% 7
 dat$current_week <- current_week
 
 svyDES <- survey::svydesign(ids = ~ SOURCE,
-                            strata  = ~ STUSAB + yr_wk,
+                            strata  = ~ STUSAB + yr_week,
                             weights = ~ weight,
                             nest = TRUE,
                             data = dat)
@@ -248,7 +291,7 @@ svyDES <- survey::trimWeights(svyDES, upper = max_weight, lower = min_wt)
 dat$weights <- weights(svyDES)
 
 ## Model-week centering (unchanged) -------------------------------------------
-time_end <- "2023-05-13"
+time_end <- "2026-01-08"
 model_weeks <- 21
 model_week_max <- as.numeric(as.Date(time_end) - week0day1) %/% 7
 model_week_min <- model_week_max - model_weeks
@@ -351,7 +394,7 @@ all.fwk2$any_flag <- as.numeric(
 )
 
 write.csv(all.fwk2,
-          file = "fourweekly_weighted_proportions.csv",
+          file = paste0(output_basename, "_weighted_proportions.csv"),
           row.names = FALSE)
 
 
@@ -371,18 +414,22 @@ dat$K_US <- match(dat$VARIANT, model_vars)
 dat$K_US[is.na(dat$K_US)] <- length(model_vars) + 1
 
 moddat <- subset(dat, model_week %in% ((1:model_weeks) - model_week_mid))
-moddat$wts <- moddat$weights / max(moddat$weights)
 
-mysvy <- survey::svydesign(ids = ~ SOURCE,
-                           strata  = ~ STUSAB + yr_wk,
-                           weights = ~ wts,
-                           nest = TRUE,
-                           data = moddat)
+# Re-scale the modeling weights so the largest is 1 (same as the original
+# pipeline, which fed rescaled weights into the survey design). With the
+# survey design removed, svymultinom aggregates on moddat$weights directly,
+# so we rescale that column in place.
+moddat$weights <- moddat$weights / max(moddat$weights)
 
-# Fit USA-only nowcast model (no HHS predictor)
+## --- CHANGE 4: no survey design object needed for the nowcast ----------------
+# The survey-design variance correction has been removed from svymultinom
+# (see helpers.R). The nowcast point estimates come from the weighted
+# nnet::multinom fit and the standard errors come from the model's
+# Hessian-based covariance, so no svydesign object is constructed or passed.
+
+# Fit USA-only nowcast model (no HHS predictor, no survey design)
 svymlm_us <- svymultinom(
   mod.dat    = moddat,
-  mysvy      = mysvy,
   fmla       = formula("as.numeric(as.factor(K_US)) ~ model_week"),
   model_vars = model_vars
 )
@@ -527,7 +574,7 @@ if (!all(results_agg[, .(total_share = sum(Share)),
   warning("Total proportion does not add up to 100% in each time period (aggregated).")
 } else {
   write.csv(results_agg,
-            file = "fourweekly_nowcast_proportions_aggregated.csv",
+            file = paste0(output_basename, "_nowcast_proportions_aggregated.csv"),
             row.names = FALSE)
 }
 
@@ -544,6 +591,6 @@ if (!all(results_nonagg[, .(total_share = sum(Share)),
   warning("Total proportion does not add up to 100% in each time period (non-aggregated).")
 } else {
   write.csv(results_nonagg,
-            file = "fourweekly_nowcast_proportions.csv",
+            file = paste0(output_basename, "_nowcast_proportions.csv"),
             row.names = FALSE)
 }
